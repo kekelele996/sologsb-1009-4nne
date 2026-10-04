@@ -49,6 +49,47 @@ interface VersionSnapshot {
   glossary: GlossaryTerm[];
 }
 
+type NavTableStatus = "draft" | "confirmed";
+type NavEntryStatus = "active" | "suspended";
+
+interface NavEntry {
+  id: string;
+  blockId: string;
+  /** 朗读先后（块编号），挂起条目保留挂起前的旧编号 */
+  order: number;
+  /** 所属分节，取最近的上级（H1/H2）标题文本 */
+  section: string;
+  /** 条目快照文案，块被删除后仍可在挂起区展示 */
+  label: string;
+  role: string;
+  status: NavEntryStatus;
+  note?: string;
+  formerOrder?: number;
+  suspendedAt?: string;
+}
+
+interface NavigationTable {
+  /** draft = 旧稿升级或重新导入后补出的待确认初稿；confirmed = 服务中心已确认 */
+  status: NavTableStatus;
+  entries: NavEntry[];
+  updatedAt: string;
+}
+
+/** 服务中心侧存储的导航表条目（中心只认块编号、朗读先后与分节） */
+interface CenterNavEntry {
+  blockId: string;
+  order: number;
+  section: string;
+  label: string;
+  role: string;
+}
+
+interface CenterRecord {
+  projectId: string;
+  entries: CenterNavEntry[];
+  updatedAt: string;
+}
+
 interface ChapterProject {
   id: string;
   title: string;
@@ -57,6 +98,7 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  navTable?: NavigationTable;
   updatedAt: string;
 }
 
@@ -71,6 +113,8 @@ interface AccessibilityIssue {
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const CENTER_KEY = "sologsb-1009-service-center-v1";
+const CENTER_LATENCY_MS = 600;
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
 function createSeedProject(): ChapterProject {
@@ -166,6 +210,22 @@ function createSeedProject(): ChapterProject {
       { id: "term-2", source: "地表径流", preferred: "沿地面流动的水", note: "首次出现时使用通俗解释" },
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
+    navTable: {
+      status: "confirmed",
+      updatedAt: new Date().toISOString(),
+      entries: blocks.map((block, index) => ({
+        id: `seed-nav-${index + 1}`,
+        blockId: block.id,
+        order: index + 1,
+        section: (() => {
+          const sections = sectionForBlocks(blocks);
+          return sections[index];
+        })(),
+        label: blockLabel(block),
+        role: blockRole(block),
+        status: "active" as NavEntryStatus,
+      })),
+    },
     versions: [],
     updatedAt: new Date().toISOString(),
   };
@@ -215,6 +275,107 @@ function blankBlock(type: BlockType, text: string, extra: Partial<ContentBlock> 
     comments: [],
     ...extra,
   };
+}
+
+function blockLabel(block: ContentBlock) {
+  if (block.type === "image") return block.imageAlt || block.accessibleText || block.text || "（图片，暂无替代文本）";
+  return block.accessibleText || block.text || "（空）";
+}
+
+/** 某一级标题是否开启新分节：H1/H2 划分朗读分节，H3 及以下归入当前分节 */
+function startsSection(level: number) {
+  return level <= 2;
+}
+
+function sectionForBlocks(blocks: ContentBlock[]) {
+  const sections: string[] = [];
+  let current = "开篇";
+  for (const block of blocks) {
+    if (block.type === "heading" && startsSection(block.headingLevel ?? 2)) {
+      current = block.accessibleText || block.text;
+    }
+    sections.push(current);
+  }
+  return sections;
+}
+
+function createDraftNavTable(blocks: ContentBlock[]): NavigationTable {
+  const sections = sectionForBlocks(blocks);
+  return {
+    status: "draft",
+    updatedAt: new Date().toISOString(),
+    entries: blocks.map((block, index) => ({
+      id: uid("nav"),
+      blockId: block.id,
+      order: index + 1,
+      section: sections[index],
+      label: blockLabel(block),
+      role: blockRole(block),
+      status: "active",
+    })),
+  };
+}
+
+/**
+ * 编辑侧与导航表对账：
+ * - 块还在：条目跟着块走（顺序、分节按现有内容重算），状态保留；
+ * - 块已删除：对应条目挂起，保留旧编号与分节，等服务中心确认；
+ * - 新增的块：补一条待确认初稿条目。
+ */
+function reconcileNavTable(table: NavigationTable, blocks: ContentBlock[]): void {
+  const sections = sectionForBlocks(blocks);
+  const active = table.entries.filter((entry) => blocks.some((block) => block.id === entry.blockId));
+  const suspended = table.entries.filter((entry) => !active.some((item) => item.id === entry.id));
+
+  for (const entry of active) {
+    const index = blocks.findIndex((block) => block.id === entry.blockId);
+    const block = blocks[index];
+    if (entry.status === "suspended") {
+      // 块重新出现（如撤销删除）：挂起条目回到编排，撤销/重做也安全
+      entry.status = "active";
+      delete entry.formerOrder;
+      delete entry.suspendedAt;
+      entry.note = "块已恢复，挂起条目重新参与编排。";
+    }
+    if (entry.status === "active") {
+      entry.order = index + 1;
+      entry.section = sections[index];
+      entry.label = blockLabel(block);
+      entry.role = blockRole(block);
+    }
+  }
+  for (const entry of suspended) {
+    if (entry.status !== "suspended") {
+      entry.status = "suspended";
+      entry.formerOrder = entry.order;
+      entry.note = `原块“${entry.label}”已从编辑稿删除，等待服务中心确认后再排。`;
+      entry.suspendedAt = new Date().toISOString();
+    }
+  }
+
+  active.sort((a, b) => {
+    const ia = blocks.findIndex((block) => block.id === a.blockId);
+    const ib = blocks.findIndex((block) => block.id === b.blockId);
+    return ia - ib;
+  });
+  for (const [index, block] of blocks.entries()) {
+    if (!active.some((entry) => entry.blockId === block.id)) {
+      active.push({
+        id: uid("nav"),
+        blockId: block.id,
+        order: index + 1,
+        section: sections[index],
+        label: blockLabel(block),
+        role: blockRole(block),
+        status: "active",
+        note: "编辑新增内容块，待服务中心确认编排。",
+      });
+    }
+  }
+  active.sort((a, b) => blocks.findIndex((block) => block.id === a.blockId) - blocks.findIndex((block) => block.id === b.blockId));
+  for (const [index, entry] of active.entries()) entry.order = index + 1;
+  table.entries = [...active, ...suspended];
+  table.updatedAt = new Date().toISOString();
 }
 
 function sentenceLength(text: string) {
@@ -391,11 +552,132 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if ((stored.schema === 1 || stored.schema === 2) && stored.project?.blocks?.length) {
+      // 旧稿没有朗读导航表：升级时按内容块现有顺序补一份待确认初稿
+      if (!stored.project.navTable) {
+        stored.project.navTable = createDraftNavTable(stored.project.blocks);
+      }
+      return stored.project;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
   return createSeedProject();
+}
+
+/**
+ * 无障碍服务中心（模拟）。中心侧用独立的 localStorage 键保存，
+ * 与编辑稿互不影响：中心拉取失败时编辑侧仍可照常修改。
+ */
+type CenterSyncState = "synced" | "pull-failed" | "request-failed" | "no-record" | "pulling" | "idle";
+
+function centerRead(): CenterRecord | null {
+  try {
+    return JSON.parse(localStorage.getItem(CENTER_KEY) ?? "null") as CenterRecord | null;
+  } catch {
+    return null;
+  }
+}
+
+function centerWrite(record: CenterRecord) {
+  localStorage.setItem(CENTER_KEY, JSON.stringify(record));
+}
+
+function seedCenterIfEmpty(project: ChapterProject) {
+  if (localStorage.getItem(CENTER_KEY) !== null) return;
+  const table = project.navTable;
+  if (!table || table.status !== "confirmed") return;
+  centerWrite({
+    projectId: project.id,
+    updatedAt: table.updatedAt,
+    entries: table.entries
+      .filter((entry) => entry.status === "active")
+      .map((entry) => ({ blockId: entry.blockId, order: entry.order, section: entry.section, label: entry.label, role: entry.role })),
+  });
+}
+
+/** 模拟一次中心网络请求；勾选“模拟中心不可用”时稳定失败 */
+function centerRequest<T>(label: string, task: () => T): Promise<T> {
+  return new Promise((resolve, reject) => {
+    window.setTimeout(() => {
+      if (centerOffline) reject(new Error(`${label}失败：服务中心暂时不可用，仅重试中心侧即可，编辑稿可继续修改。`));
+      else {
+        try {
+          resolve(task());
+        } catch (error) {
+          reject(error);
+        }
+      }
+    }, CENTER_LATENCY_MS);
+  });
+}
+
+/**
+ * 用中心侧导航表与编辑稿对账：
+ * - 对得上的条目跟随编辑稿的块位置与分节，保持“已确认”；
+ * - 中心有、编辑稿没有的块（如别处删图）→ 挂起待确认；
+ * - 编辑稿新增的块 → 初稿条目；中心无记录时整份保持为待确认初稿。
+ */
+function mergeCenterTable(projectDraft: ChapterProject, center: CenterRecord): void {
+  const blocks = projectDraft.blocks;
+  const sections = sectionForBlocks(blocks);
+  const existing = projectDraft.navTable;
+  // 本地已有导航表（含待确认初稿）：以编辑稿为准重新对账，中心只负责确认与挂起裁决
+  if (existing) {
+    reconcileNavTable(existing, blocks);
+    return;
+  }
+
+  const entries: NavEntry[] = center.entries.map((centerEntry, index) => {
+    const blockIndex = blocks.findIndex((block) => block.id === centerEntry.blockId);
+    if (blockIndex >= 0) {
+      return {
+        id: uid("nav"),
+        blockId: centerEntry.blockId,
+        order: blockIndex + 1,
+        section: sections[blockIndex],
+        label: blockLabel(blocks[blockIndex]),
+        role: blockRole(blocks[blockIndex]),
+        status: "active",
+      };
+    }
+    return {
+      id: uid("nav"),
+      blockId: centerEntry.blockId,
+      order: centerEntry.order,
+      formerOrder: centerEntry.order,
+      section: centerEntry.section,
+      label: centerEntry.label,
+      role: centerEntry.role,
+      status: "suspended",
+      note: `中心导航表指向的块（原编号 ${centerEntry.order}）不在当前编辑稿中，挂起待中心确认。`,
+      suspendedAt: new Date().toISOString(),
+    };
+  });
+
+  for (const [index, block] of blocks.entries()) {
+    if (!entries.some((entry) => entry.status === "active" && entry.blockId === block.id)) {
+      entries.push({
+        id: uid("nav"),
+        blockId: block.id,
+        order: index + 1,
+        section: sections[index],
+        label: blockLabel(block),
+        role: blockRole(block),
+        status: "active",
+        note: "编辑侧新增内容块，待服务中心确认编排。",
+      });
+    }
+  }
+
+  const table: NavigationTable = {
+    status: "confirmed",
+    updatedAt: new Date().toISOString(),
+    entries: [],
+  };
+  projectDraft.navTable = table;
+  table.entries = entries;
+  reconcileNavTable(table, blocks);
 }
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
@@ -403,22 +685,28 @@ if (!rootElement) throw new Error("Application root was not found");
 const app: HTMLDivElement = rootElement;
 
 let project = loadProject();
+seedCenterIfEmpty(project);
 let activeBlockId = project.blocks[0]?.id ?? "";
 let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let centerOffline = false;
+let centerSync: CenterSyncState = "idle";
+let centerMessage = "";
+let centerBusyLabel = "";
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+const suspendedEntries = () => project.navTable?.entries.filter((entry) => entry.status === "suspended") ?? [];
 
 function saveSoon() {
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, project }));
   }, 320);
 }
 
@@ -427,6 +715,8 @@ function commit(label: string, update: (draft: ChapterProject) => void, renderAf
   redoStack = [];
   const draft = structuredClone(project);
   update(draft);
+  // 编辑挪动内容块、改标题层级或删图片后，两边重新对账
+  if (draft.navTable) reconcileNavTable(draft.navTable, draft.blocks);
   draft.updatedAt = new Date().toISOString();
   project = draft;
   document.documentElement.dataset.lastAction = label;
@@ -439,6 +729,7 @@ function undo() {
   if (!previous) return;
   redoStack = [structuredClone(project), ...redoStack].slice(0, 50);
   project = previous;
+  if (project.navTable) reconcileNavTable(project.navTable, project.blocks);
   if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
   saveSoon();
   render();
@@ -449,6 +740,7 @@ function redo() {
   if (!next) return;
   undoStack = [...undoStack.slice(-49), structuredClone(project)];
   project = next;
+  if (project.navTable) reconcileNavTable(project.navTable, project.blocks);
   saveSoon();
   render();
 }
@@ -458,6 +750,132 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
     const block = draft.blocks.find((item) => item.id === activeBlockId);
     if (block) update(block, draft);
   }, renderAfter);
+}
+
+let pendingCenterAction: null | (() => Promise<void>) = null;
+
+async function runPendingCenterAction() {
+  const action = pendingCenterAction;
+  if (!action) return;
+  await action();
+}
+
+async function pullFromCenter() {
+  pendingCenterAction = pullFromCenter;
+  centerSync = "pulling";
+  centerBusyLabel = "";
+  centerMessage = "";
+  render();
+  try {
+    const center = await centerRequest("拉取导航表", () => centerRead());
+    // 拉取失败只影响服务中心这侧；成功后两边重新对账，对得上的条目跟着编辑稿
+    if (!center || !center.entries.length) {
+      centerSync = "no-record";
+    } else {
+      mergeCenterTable(project, center);
+      document.documentElement.dataset.lastAction = "拉取服务中心导航表并对账";
+      saveSoon();
+      centerSync = "synced";
+    }
+    pendingCenterAction = null;
+    render();
+  } catch (error) {
+    centerSync = "pull-failed";
+    centerMessage = error instanceof Error ? error.message : "服务中心拉取失败";
+    render();
+  }
+}
+
+async function submitDraftToCenter() {
+  const table = project.navTable;
+  if (!table || table.status !== "draft") return;
+  pendingCenterAction = submitDraftToCenter;
+  centerBusyLabel = "提交初稿";
+  centerMessage = "";
+  render();
+  const snapshot = structuredClone(table);
+  try {
+    await centerRequest("提交待确认初稿", () => {
+      centerWrite({
+        projectId: project.id,
+        updatedAt: new Date().toISOString(),
+        entries: snapshot.entries
+          .filter((entry) => entry.status === "active")
+          .map((entry) => ({ blockId: entry.blockId, order: entry.order, section: entry.section, label: entry.label, role: entry.role })),
+      });
+    });
+    commit("服务中心确认初稿", (draft) => {
+      if (draft.navTable) draft.navTable.status = "confirmed";
+    });
+    centerSync = "synced";
+    pendingCenterAction = null;
+    centerBusyLabel = "";
+    render();
+  } catch (error) {
+    centerSync = "request-failed";
+    centerBusyLabel = "";
+    centerMessage = error instanceof Error ? error.message : "服务中心请求失败";
+    render();
+  }
+}
+
+async function confirmSuspendedEntry(entryId: string, remapBlockId: string) {
+  const entry = project.navTable?.entries.find((item) => item.id === entryId);
+  if (!entry || entry.status !== "suspended") return;
+  pendingCenterAction = () => confirmSuspendedEntry(entryId, remapBlockId);
+  centerBusyLabel = "送服务中心确认挂起条目";
+  centerMessage = "";
+  render();
+  const targetBlockId = remapBlockId || entry.blockId;
+  try {
+    await centerRequest("确认挂起导航条目", () => {
+      const center = centerRead();
+      if (center) {
+        if (remapBlockId) {
+          const block = project.blocks.find((item) => item.id === remapBlockId);
+          if (block) {
+            const sections = sectionForBlocks(project.blocks);
+            const index = project.blocks.indexOf(block);
+            const kept = center.entries.filter((item) => item.blockId !== entry.blockId);
+            kept.push({ blockId: block.id, order: index + 1, section: sections[index], label: blockLabel(block), role: blockRole(block) });
+            center.entries = kept;
+          }
+        } else {
+          center.entries = center.entries.filter((item) => item.blockId !== targetBlockId);
+        }
+        center.updatedAt = new Date().toISOString();
+        centerWrite(center);
+      }
+    });
+    commit("挂起条目经服务中心确认后处理", (draft) => {
+      const table = draft.navTable;
+      if (!table) return;
+      if (remapBlockId) {
+        const target = table.entries.find((item) => item.id === entryId);
+        const remapped = table.entries.some((item) => item.status === "active" && item.blockId === remapBlockId);
+        if (target && !remapped) {
+          target.blockId = remapBlockId;
+          target.status = "active";
+          target.note = "原挂起条目已改指新内容块，中心已确认。";
+          delete target.formerOrder;
+          delete target.suspendedAt;
+        } else if (target) {
+          table.entries = table.entries.filter((item) => item.id !== entryId);
+        }
+      } else {
+        table.entries = table.entries.filter((item) => item.id !== entryId);
+      }
+    });
+    centerSync = "synced";
+    pendingCenterAction = null;
+    centerBusyLabel = "";
+    render();
+  } catch (error) {
+    centerSync = "request-failed";
+    centerBusyLabel = "";
+    centerMessage = error instanceof Error ? error.message : "服务中心请求失败";
+    render();
+  }
 }
 
 function render() {
@@ -501,12 +919,17 @@ function render() {
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
-              return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
+              return `<div class="block-item ${block.id === active.id ? "active" : ""}" role="button" tabindex="0" aria-label="第 ${index + 1} 块：${blockRole(block)}，${escapeHtml(block.accessibleText || block.text || "空")}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
-              </button>`;
+                <span class="block-actions">
+                  <button type="button" title="上移内容块" aria-label="上移内容块" data-action="move-block" data-block-id="${block.id}" data-direction="up" ${index === 0 ? "disabled" : ""}>↑</button>
+                  <button type="button" title="下移内容块" aria-label="下移内容块" data-action="move-block" data-block-id="${block.id}" data-direction="down" ${index === project.blocks.length - 1 ? "disabled" : ""}>↓</button>
+                  ${block.type === "image" ? `<button type="button" class="danger" title="删除图片（导航条目将挂起）" aria-label="删除图片" data-action="delete-block" data-block-id="${block.id}">删图</button>` : ""}
+                </span>
+              </div>`;
             }).join("")}
           </div>
           <input id="chapter-file" type="file" accept=".txt,.md,.markdown" hidden />
@@ -560,6 +983,32 @@ function render() {
         </main>
 
         <aside class="review-panel">
+          <section class="nav-card">
+            <div class="section-heading">
+              <div><span class="eyebrow">Service center · Reading navigation</span><h2>朗读导航表</h2></div>
+              <sl-badge variant="${project.navTable?.status === "confirmed" ? "success" : "warning"}">${project.navTable?.status === "confirmed" ? "中心已确认" : "待确认初稿"}</sl-badge>
+            </div>
+            <div class="nav-sync ${centerSync === "pull-failed" || centerSync === "request-failed" ? "error" : centerSync === "synced" ? "ok" : ""}">
+              ${renderNavSync()}
+            </div>
+            ${project.navTable?.status === "draft" ? `<div class="nav-banner">旧稿没有朗读导航表，已按内容块现有顺序补出待确认初稿；中心确认后生效。</div>` : ""}
+            <ol class="nav-entries">
+              ${(project.navTable?.entries.filter((entry) => entry.status === "active") ?? []).map((entry) => {
+                const block = project.blocks.find((item) => item.id === entry.blockId);
+                return `<li class="${block?.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${entry.blockId}" role="button" tabindex="0">
+                  <b>${entry.order}</b>
+                  <div><strong>${escapeHtml(entry.role)}</strong><span>${escapeHtml(entry.label)}</span><small class="nav-section">分节：${escapeHtml(entry.section)}</small>${entry.note ? `<small class="nav-note">${escapeHtml(entry.note)}</small>` : ""}</div>
+                </li>`;
+              }).join("")}
+            </ol>
+            ${renderSuspendedEntries()}
+            <div class="nav-toolbar">
+              <sl-button size="small" variant="primary" outline data-action="pull-nav" ${centerBusyLabel ? "disabled" : ""}>${centerSync === "pulling" ? "拉取中…" : "重新拉取导航表"}</sl-button>
+              ${project.navTable?.status === "draft" ? `<sl-button size="small" variant="primary" data-action="submit-draft" ${centerBusyLabel ? "disabled" : ""}>${centerSync === "pulling" || centerBusyLabel === "提交初稿" ? "提交中…" : "提交初稿给中心确认"}</sl-button>` : ""}
+              <label class="offline-toggle"><input type="checkbox" data-field="center-offline" ${centerOffline ? "checked" : ""}><span>模拟中心不可用</span></label>
+            </div>
+          </section>
+
           <section class="preview-card">
             <div class="section-heading"><div><span class="eyebrow">Reader preview</span><h2>阅读预览</h2></div><div class="mode-switch"><button class="${previewMode === "normal" ? "active" : ""}" data-action="preview-normal">普通</button><button class="${previewMode === "assisted" ? "active" : ""}" data-action="preview-assisted">辅助</button></div></div>
             <div class="reader-preview mode-${previewMode}">${renderPreview()}</div>
@@ -648,6 +1097,38 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
 
+function renderNavSync() {
+  const activeCount = project.navTable?.entries.filter((entry) => entry.status === "active").length ?? 0;
+  const suspendedCount = suspendedEntries().length;
+  const summary = `<div class="nav-summary"><span>${activeCount} 条在编</span><span>${suspendedCount} 条挂起</span><small>更新于 ${new Date(project.navTable?.updatedAt ?? Date.now()).toLocaleTimeString()}</small></div>`;
+  if (centerSync === "pulling") return `${summary}<p class="nav-message">正在从服务中心拉取导航表……</p>`;
+  if (centerBusyLabel) return `${summary}<p class="nav-message">${escapeHtml(centerBusyLabel)}……</p>`;
+  if (centerSync === "pull-failed") return `${summary}<p class="nav-message">${escapeHtml(centerMessage)}</p><sl-button size="small" variant="danger" outline data-action="retry-center">只重试服务中心</sl-button><p class="nav-hint">编辑稿不受影响，可继续改写、挪动内容块。</p>`;
+  if (centerSync === "request-failed") return `${summary}<p class="nav-message">${escapeHtml(centerMessage)}</p><sl-button size="small" variant="danger" outline data-action="retry-center">重试服务中心</sl-button>`;
+  if (centerSync === "synced") return `${summary}<p class="nav-message ok">服务中心导航表已同步（${new Date().toLocaleTimeString()}）</p>`;
+  if (centerSync === "no-record") return `${summary}<p class="nav-message">服务中心还没有这一章的导航表，请提交待确认初稿。</p>`;
+  return `${summary}<p class="nav-message muted">本地对账会随编辑自动进行；需要时可向服务中心重新拉取。</p>`;
+}
+
+function renderSuspendedEntries() {
+  const suspended = suspendedEntries();
+  if (!suspended.length) return "";
+  return `<div class="nav-suspended">
+    <div class="suspended-head"><b>挂起 · 待服务中心确认</b><sl-badge variant="danger">${suspended.length}</sl-badge></div>
+    ${suspended.map((entry) => `
+      <div class="suspended-row">
+        <div class="suspended-copy"><s>#${entry.formerOrder ?? entry.order}</s><strong>${escapeHtml(entry.role)}</strong><span>${escapeHtml(entry.label)}</span><small>${escapeHtml(entry.note ?? "")}</small></div>
+        <div class="suspended-confirm">
+          <select data-field="remap" data-entry-id="${entry.id}" aria-label="为挂起条目选择新的内容块">
+            <option value="">从导航表移除</option>
+            ${project.blocks.map((block) => `<option value="${block.id}">改指：${escapeHtml(blockLabel(block).slice(0, 18))}</option>`).join("")}
+          </select>
+          <sl-button size="small" variant="default" data-action="confirm-suspended" data-entry-id="${entry.id}" ${centerBusyLabel ? "disabled" : ""}>送中心确认</sl-button>
+        </div>
+      </div>`).join("")}
+  </div>`;
+}
+
 function wireLiveFields() {
   app.querySelectorAll<HTMLElement>("sl-input[data-field], sl-textarea[data-field], sl-select[data-field]").forEach((element) => {
     element.addEventListener("sl-input", () => {
@@ -678,10 +1159,39 @@ app.addEventListener("click", (event) => {
   const action = target.dataset.action;
   if (action === "undo") undo();
   if (action === "redo") redo();
-  if (action === "select-block") {
+  if (action === "select-block" && !target.closest(".block-actions")) {
     activeBlockId = target.dataset.blockId ?? activeBlockId;
     activeIssueId = "";
     render();
+  }
+  if (action === "move-block") {
+    const blockId = target.dataset.blockId ?? "";
+    const direction = target.dataset.direction === "down" ? 1 : -1;
+    commit("挪动内容块，导航表重新对账", (draft) => {
+      const index = draft.blocks.findIndex((block) => block.id === blockId);
+      const targetIndex = index + direction;
+      if (index < 0 || targetIndex < 0 || targetIndex >= draft.blocks.length) return;
+      const [moved] = draft.blocks.splice(index, 1);
+      draft.blocks.splice(targetIndex, 0, moved);
+      activeBlockId = blockId;
+    });
+  }
+  if (action === "delete-block") {
+    const blockId = target.dataset.blockId ?? "";
+    commit("删除图片，导航条目挂起待确认", (draft) => {
+      const block = draft.blocks.find((item) => item.id === blockId);
+      if (!block || block.type !== "image") return;
+      draft.blocks = draft.blocks.filter((item) => item.id !== blockId);
+      if (activeBlockId === blockId) activeBlockId = draft.blocks[0]?.id ?? "";
+    });
+  }
+  if (action === "pull-nav") void pullFromCenter();
+  if (action === "retry-center") void runPendingCenterAction();
+  if (action === "submit-draft") void submitDraftToCenter();
+  if (action === "confirm-suspended") {
+    const entryId = target.dataset.entryId ?? "";
+    const select = app.querySelector<HTMLSelectElement>(`select[data-entry-id="${CSS.escape(entryId)}"]`);
+    void confirmSuspendedEntry(entryId, select?.value ?? "");
   }
   if (action === "jump-issue") {
     activeIssueId = target.dataset.issueId ?? "";
@@ -780,10 +1290,19 @@ app.addEventListener("sl-change", (event) => {
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
+  if (input.dataset.field === "center-offline") {
+    centerOffline = input.checked;
+    centerSync = "idle";
+    centerMessage = "";
+    render();
+    return;
+  }
   if (input.id !== "chapter-file" || !input.files?.[0]) return;
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
       draft.blocks = parseImportedChapter(text);
+      // 重新导入后旧导航表不再适用，按现有内容块顺序补一份待确认初稿
+      draft.navTable = createDraftNavTable(draft.blocks);
       activeBlockId = draft.blocks[0]?.id ?? "";
       activeIssueId = "";
     });
@@ -803,6 +1322,11 @@ window.addEventListener("offline", render);
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement;
   if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
+  if (target.matches('[role="button"]') && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    (target as HTMLElement).click();
+    return;
+  }
   const command = event.metaKey || event.ctrlKey;
   if (command && event.key.toLowerCase() === "z") {
     event.preventDefault();
@@ -834,3 +1358,4 @@ window.addEventListener("keydown", (event) => {
 });
 
 render();
+void pullFromCenter();
