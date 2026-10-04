@@ -3,6 +3,7 @@ import "@shoelace-style/shoelace/dist/shoelace.js";
 type BlockType = "heading" | "paragraph" | "image" | "link";
 type ReviewStatus = "pending" | "approved" | "needs-work";
 type Severity = "error" | "warning" | "info";
+type NavEntryStatus = "confirmed" | "pending" | "suspended";
 
 interface CommentReply {
   id: string;
@@ -57,6 +58,7 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  navTable: ReadingNavTable;
   updatedAt: string;
 }
 
@@ -70,8 +72,109 @@ interface AccessibilityIssue {
   suggestion: string;
 }
 
-const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+interface NavEntry {
+  blockId: string;
+  order: number;
+  section: string;
+  status: NavEntryStatus;
+}
+
+interface ReadingNavTable {
+  entries: NavEntry[];
+  syncedAt: string | null;
+  pullFailed: boolean;
+  lastError: string;
+  locallyBuilt: boolean;
+}
+
+const STORAGE_KEY = "sologsb-1009-accessible-textbook-v2";
+const SERVICE_CENTER_KEY = "sologsb-1009-service-center-v1";
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+type ServiceCenterStore = Record<string, { entries: NavEntry[]; seededAt: string }>;
+
+function readServiceCenterStore(): ServiceCenterStore {
+  try {
+    return JSON.parse(localStorage.getItem(SERVICE_CENTER_KEY) ?? "{}") as ServiceCenterStore;
+  } catch {
+    return {};
+  }
+}
+
+function writeServiceCenterStore(store: ServiceCenterStore) {
+  localStorage.setItem(SERVICE_CENTER_KEY, JSON.stringify(store));
+}
+
+function sectionForBlock(blocks: ContentBlock[], index: number): string {
+  for (let i = index; i >= 0; i--) {
+    if (blocks[i].type === "heading") {
+      return blocks[i].text || `H${blocks[i].headingLevel ?? 2}`;
+    }
+  }
+  return "正文";
+}
+
+function buildNavTableFromBlocks(blocks: ContentBlock[], status: NavEntryStatus, locallyBuilt: boolean): ReadingNavTable {
+  return {
+    entries: blocks.map((block, index) => ({
+      blockId: block.id,
+      order: index + 1,
+      section: sectionForBlock(blocks, index),
+      status,
+    })),
+    syncedAt: null,
+    pullFailed: false,
+    lastError: "",
+    locallyBuilt,
+  };
+}
+
+function reconcileNavTable(nav: ReadingNavTable, blocks: ContentBlock[]): ReadingNavTable {
+  const blockIds = new Set(blocks.map((block) => block.id));
+  const blockIndex = new Map(blocks.map((block, index) => [block.id, index]));
+  const matched: NavEntry[] = [];
+  const suspended: NavEntry[] = [];
+
+  for (const entry of nav.entries) {
+    if (blockIds.has(entry.blockId)) {
+      const index = blockIndex.get(entry.blockId)!;
+      matched.push({
+        ...entry,
+        order: index + 1,
+        section: sectionForBlock(blocks, index),
+        status: entry.status === "suspended" ? "pending" : entry.status,
+      });
+    } else {
+      suspended.push({ ...entry, status: "suspended" });
+    }
+  }
+
+  const known = new Set(matched.map((entry) => entry.blockId));
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index];
+    if (!known.has(block.id)) {
+      matched.push({ blockId: block.id, order: index + 1, section: sectionForBlock(blocks, index), status: "pending" });
+    }
+  }
+
+  matched.sort((a, b) => a.order - b.order);
+  return { ...nav, entries: [...matched, ...suspended] };
+}
+
+async function pullFromServiceCenter(project: ChapterProject): Promise<{ ok: true; entries: NavEntry[] } | { ok: false; error: string }> {
+  await new Promise((resolve) => window.setTimeout(resolve, 420 + Math.random() * 380));
+  if (Math.random() < 0.3) {
+    return { ok: false, error: "服务中心导航表暂时不可用，请稍后重试。" };
+  }
+  const store = readServiceCenterStore();
+  let copy = store[project.id];
+  if (!copy) {
+    copy = { entries: buildNavTableFromBlocks(project.blocks, "confirmed", false).entries, seededAt: new Date().toISOString() };
+    store[project.id] = copy;
+    writeServiceCenterStore(store);
+  }
+  return { ok: true, entries: copy.entries.map((entry) => ({ ...entry })) };
+}
 
 function createSeedProject(): ChapterProject {
   const blocks: ContentBlock[] = [
@@ -155,6 +258,9 @@ function createSeedProject(): ChapterProject {
     },
   ];
 
+  const navTable = buildNavTableFromBlocks(blocks, "confirmed", false);
+  navTable.syncedAt = new Date().toISOString();
+
   return {
     id: "accessible-textbook-1009",
     title: "科学（五年级下册）·无障碍改写稿",
@@ -167,6 +273,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    navTable,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -391,7 +498,20 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 2 && stored.project?.blocks?.length) {
+      const project = stored.project;
+      if (!project.navTable || !Array.isArray(project.navTable.entries)) {
+        project.navTable = buildNavTableFromBlocks(project.blocks, "pending", true);
+      }
+      project.navTable = reconcileNavTable(project.navTable, project.blocks);
+      return project;
+    }
+    if (stored.schema === 1 && stored.project?.blocks?.length) {
+      const project = stored.project;
+      project.navTable = buildNavTableFromBlocks(project.blocks, "pending", true);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, project }));
+      return project;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -408,6 +528,7 @@ let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let pullInFlight = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
@@ -460,6 +581,35 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+function applyBlockMutation(label: string, mutate: (draft: ChapterProject) => void) {
+  commit(label, (draft) => {
+    mutate(draft);
+    draft.navTable = reconcileNavTable(draft.navTable, draft.blocks);
+  });
+}
+
+async function pullNavTable() {
+  if (pullInFlight) return;
+  pullInFlight = true;
+  render();
+  const result = await pullFromServiceCenter(project);
+  pullInFlight = false;
+  undoStack = [...undoStack.slice(-49), structuredClone(project)];
+  redoStack = [];
+  if (result.ok) {
+    project.navTable = reconcileNavTable(
+      { entries: result.entries, syncedAt: null, pullFailed: false, lastError: "", locallyBuilt: false },
+      project.blocks,
+    );
+    project.navTable.syncedAt = new Date().toISOString();
+  } else {
+    project.navTable.pullFailed = true;
+    project.navTable.lastError = result.error;
+  }
+  saveSoon();
+  render();
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
@@ -501,12 +651,16 @@ function render() {
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
-              return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
+              return `<div class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
+                <span class="block-move">
+                  <button data-action="move-up" data-block-id="${block.id}" title="上移内容块" ${index === 0 ? "disabled" : ""}>↑</button>
+                  <button data-action="move-down" data-block-id="${block.id}" title="下移内容块" ${index === project.blocks.length - 1 ? "disabled" : ""}>↓</button>
+                </span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
-              </button>`;
+              </div>`;
             }).join("")}
           </div>
           <input id="chapter-file" type="file" accept=".txt,.md,.markdown" hidden />
@@ -520,6 +674,7 @@ function render() {
             <div class="review-actions">
               <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
+              <sl-button size="small" variant="danger" outline data-action="delete-block">${active.type === "image" ? "删除图片" : "删除内容块"}</sl-button>
             </div>
           </div>
 
@@ -565,11 +720,47 @@ function render() {
             <div class="reader-preview mode-${previewMode}">${renderPreview()}</div>
           </section>
 
-          <section class="order-card">
-            <div class="section-heading"><div><span class="eyebrow">Screen reader order</span><h2>读屏阅读顺序</h2></div><sl-badge>从上到下</sl-badge></div>
-            <ol class="reading-order">
-              ${project.blocks.map((block, index) => `<li class="${block.id === active.id ? "active" : ""}"><b>${index + 1}</b><div><strong>${blockRole(block)}</strong><span>${escapeHtml(block.accessibleText || block.text || "（无内容）")}</span></div></li>`).join("")}
+          <section class="order-card nav-card">
+            <div class="section-heading">
+              <div><span class="eyebrow">Reading nav table</span><h2>朗读导航表</h2></div>
+              <sl-badge variant="neutral">服务中心</sl-badge>
+            </div>
+            ${project.navTable.pullFailed ? `
+              <div class="nav-banner error">
+                <span>导航表拉取失败（服务中心侧）。编辑稿仍可正常编辑，稍后可重试。</span>
+                <sl-button size="small" variant="danger" outline data-action="retry-pull" ${pullInFlight ? "loading" : ""}>重试服务中心</sl-button>
+              </div>
+            ` : ""}
+            ${project.navTable.locallyBuilt && !project.navTable.pullFailed ? `
+              <div class="nav-banner info">
+                <span>导航表为本地按内容块现有顺序整理的待确认初稿，待服务中心确认后生效。</span>
+              </div>
+            ` : ""}
+            <div class="nav-meta">
+              <span>${project.navTable.syncedAt ? `最近同步 ${new Date(project.navTable.syncedAt).toLocaleTimeString()}` : "尚未同步"}</span>
+              <sl-button size="small" variant="default" outline data-action="pull-nav-table" ${pullInFlight ? "loading" : ""}>重新拉取</sl-button>
+            </div>
+            <div class="nav-counts">
+              <span class="confirmed">已确认 ${project.navTable.entries.filter((entry) => entry.status === "confirmed").length}</span>
+              <span class="pending">待确认 ${project.navTable.entries.filter((entry) => entry.status === "pending").length}</span>
+              <span class="suspended">挂起 ${project.navTable.entries.filter((entry) => entry.status === "suspended").length}</span>
+            </div>
+            <ol class="reading-order nav-entries">
+              ${project.navTable.entries.filter((entry) => entry.status !== "suspended").map((entry) => {
+                const block = project.blocks.find((item) => item.id === entry.blockId);
+                if (!block) return "";
+                return `<li class="${block.id === active.id ? "active" : ""}"><b>${entry.order}</b><div><strong>${escapeHtml(entry.section)}</strong><span>${blockRole(block)} · ${escapeHtml(block.accessibleText || block.text || "（无内容）")}</span></div><i class="nav-status ${entry.status}" title="${entry.status === "confirmed" ? "已确认" : "待确认"}"></i></li>`;
+              }).join("")}
             </ol>
+            ${project.navTable.entries.some((entry) => entry.status === "suspended") ? `
+              <div class="nav-suspended">
+                <div class="nav-suspended-head">
+                  <span>已挂起（${project.navTable.entries.filter((entry) => entry.status === "suspended").length}）</span>
+                  <sl-button size="small" variant="danger" outline data-action="confirm-suspended">服务中心确认删除</sl-button>
+                </div>
+                ${project.navTable.entries.filter((entry) => entry.status === "suspended").map((entry) => `<div class="nav-suspended-item"><b>${entry.order}</b><span>原内容块已删除，条目挂起等待服务中心确认后移除。</span></div>`).join("")}
+              </div>
+            ` : ""}
           </section>
 
           <section class="issues-panel">
@@ -683,6 +874,32 @@ app.addEventListener("click", (event) => {
     activeIssueId = "";
     render();
   }
+  if (action === "move-up" || action === "move-down") {
+    const blockId = target.dataset.blockId ?? "";
+    applyBlockMutation(action === "move-up" ? "上移内容块" : "下移内容块", (draft) => {
+      const index = draft.blocks.findIndex((block) => block.id === blockId);
+      const swapWith = action === "move-up" ? index - 1 : index + 1;
+      if (index < 0 || swapWith < 0 || swapWith >= draft.blocks.length) return;
+      [draft.blocks[index], draft.blocks[swapWith]] = [draft.blocks[swapWith], draft.blocks[index]];
+      activeBlockId = blockId;
+    });
+  }
+  if (action === "delete-block") {
+    applyBlockMutation("删除内容块", (draft) => {
+      draft.blocks = draft.blocks.filter((block) => block.id !== activeBlockId);
+      if (!draft.blocks.length) draft.blocks.push(blankBlock("paragraph", "空章节"));
+      activeBlockId = draft.blocks[0]?.id ?? "";
+      activeIssueId = "";
+    });
+  }
+  if (action === "pull-nav-table" || action === "retry-pull") {
+    void pullNavTable();
+  }
+  if (action === "confirm-suspended") {
+    commit("服务中心确认挂起项", (draft) => {
+      draft.navTable.entries = draft.navTable.entries.filter((entry) => entry.status !== "suspended");
+    });
+  }
   if (action === "jump-issue") {
     activeIssueId = target.dataset.issueId ?? "";
     activeBlockId = target.dataset.blockId ?? activeBlockId;
@@ -765,7 +982,13 @@ app.addEventListener("sl-change", (event) => {
   if (element.id === "chapter-file") return;
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
-    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
+    applyBlockMutation("修改标题层级", (draft) => {
+      const block = draft.blocks.find((item) => item.id === activeBlockId);
+      if (block) {
+        block.headingLevel = level;
+        block.reviewStatus = "pending";
+      }
+    });
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
@@ -784,6 +1007,7 @@ app.addEventListener("change", (event) => {
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
       draft.blocks = parseImportedChapter(text);
+      draft.navTable = buildNavTableFromBlocks(draft.blocks, "pending", true);
       activeBlockId = draft.blocks[0]?.id ?? "";
       activeIssueId = "";
     });
